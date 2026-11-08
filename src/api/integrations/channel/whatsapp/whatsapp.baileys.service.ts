@@ -85,6 +85,7 @@ import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { groupReceiptToServerAck } from '@utils/groupReceiptAck';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -529,27 +530,36 @@ export class BaileysStartupService extends ChannelStartupService {
         AND "key"->>'id' = ${key.id}
       `) as proto.IWebMessageInfo[];
 
-      if (full) {
-        return webMessageInfo[0];
+      // A missing message must not produce a fake empty envelope: Baileys
+      // retries can consume the last retry attempt on an empty response.
+      const storedMessage = webMessageInfo[0];
+      if (!storedMessage) {
+        this.logger.warn("Baileys getMessage: message not found; no retry payload available");
+        return undefined;
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
-        const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
+
+      if (full) {
+        return storedMessage;
+      }
+      if (storedMessage.message?.pollCreationMessage) {
+        const messageSecretBase64 = storedMessage.message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
           const messageSecret = Buffer.from(messageSecretBase64, 'base64');
 
           const msg = {
             messageContextInfo: { messageSecret },
-            pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
+            pollCreationMessage: storedMessage.message?.pollCreationMessage,
           };
 
           return msg;
         }
       }
 
-      return webMessageInfo[0].message;
+      return storedMessage.message;
     } catch {
-      return { conversation: '' };
+      this.logger.warn("Baileys getMessage: lookup failed; refusing to relay an empty retry");
+      return undefined;
     }
   }
 
@@ -1931,6 +1941,16 @@ export class BaileysStartupService extends ChannelStartupService {
               for (const event of payload) {
                 if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
                   remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                }
+
+                // A member receipt proves at least one member received this
+                // outbound group message, NOT delivery to the entire group.
+                const groupAck = groupReceiptToServerAck(event, settings?.groupsIgnore === true);
+                if (groupAck) {
+                  this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                    ...groupAck,
+                    instanceId: this.instanceId,
+                  });
                 }
               }
 
